@@ -1,0 +1,7 @@
+.DS_Store
+.venv/
+CLAUDE.md
+co2-sensor/.esphome/
+co2-sensor/secrets.yaml
+co2-sensor/local.yaml
+co2-sensor/battery-log.json

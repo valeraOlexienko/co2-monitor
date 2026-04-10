@@ -1,0 +1,7 @@
+static_ip: "192.168.1.100"
+gateway: "192.168.1.1"
+subnet: "255.255.255.0"
+timezone: "America/New_York"
+display_name: "Home"
+fallback_ap_ssid: "co2-sensor-fallback"
+fallback_ap_password: "changeme"
