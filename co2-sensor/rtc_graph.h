@@ -20,6 +20,14 @@ RTC_DATA_ATTR int   rtc_batt_pct    = 0;
 RTC_DATA_ATTR float rtc_last_batt_v = 0.0f;
 RTC_DATA_ATTR bool  rtc_is_charging = false;
 
+// Diagnostic: last detected wipe event.
+// Set in on_boot when magic mismatch indicates RTC was wiped. Survives
+// subsequent wakes (magic is OK again) so the cause is retrievable later
+// via WiFi-on log session — no flash wear required.
+RTC_DATA_ATTR uint8_t  rtc_last_wipe_reason = 0;   // esp_reset_reason_t of last wipe
+RTC_DATA_ATTR uint8_t  rtc_last_wipe_wakeup = 0;   // esp_sleep_wakeup_cause_t of last wipe
+RTC_DATA_ATTR uint32_t rtc_last_wipe_boot  = 0;    // rtc_boot_count value just before last wipe
+
 // Call once in on_boot — detects garbage RTC after new firmware or power cycle
 inline void rtc_validate() {
     if (rtc_magic != RTC_MAGIC_VAL) {

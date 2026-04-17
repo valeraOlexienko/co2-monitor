@@ -14,6 +14,40 @@ esphome:
           gpio_hold_dis(GPIO_NUM_16);
           gpio_hold_dis(GPIO_NUM_17);
           gpio_deep_sleep_hold_dis();
+          // Diagnostic: capture reset cause + pre-validate RTC state.
+          // Catches brownouts, WDTs, and RTC-SLOW-MEM power loss across sleep.
+          // When magic mismatch indicates a wipe, stash the cause in RTC
+          // vars that survive subsequent OK wakes, so the reason is
+          // retrievable later via WiFi-on log session.
+          {
+            esp_reset_reason_t rr = esp_reset_reason();
+            esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+            bool wiped = (rtc_magic != RTC_MAGIC_VAL);
+            if (wiped) {
+              rtc_last_wipe_reason = (uint8_t)rr;
+              rtc_last_wipe_wakeup = (uint8_t)wc;
+              rtc_last_wipe_boot   = (uint32_t)rtc_boot_count;
+            }
+            auto name_of = [](esp_reset_reason_t r) {
+              return r == ESP_RST_POWERON   ? "POWERON"   :
+                     r == ESP_RST_EXT       ? "EXT"       :
+                     r == ESP_RST_SW        ? "SW"        :
+                     r == ESP_RST_PANIC     ? "PANIC"     :
+                     r == ESP_RST_INT_WDT   ? "INT_WDT"   :
+                     r == ESP_RST_TASK_WDT  ? "TASK_WDT"  :
+                     r == ESP_RST_WDT       ? "WDT"       :
+                     r == ESP_RST_DEEPSLEEP ? "DEEPSLEEP" :
+                     r == ESP_RST_BROWNOUT  ? "BROWNOUT"  :
+                     "UNKNOWN";
+            };
+            ESP_LOGW("boot", "reset=%s(%d) wake=%d rtc_boot#=%d buf=%d magic=%s",
+                     name_of(rr), rr, wc, rtc_boot_count, rtc_count,
+                     wiped ? "WIPED" : "OK");
+            ESP_LOGW("boot", "last_wipe: reason=%s(%d) wake=%d at_boot#=%u",
+                     name_of((esp_reset_reason_t)rtc_last_wipe_reason),
+                     rtc_last_wipe_reason, rtc_last_wipe_wakeup,
+                     (unsigned)rtc_last_wipe_boot);
+          }
           rtc_validate();  // Fix garbage RTC after firmware change / power cycle
           rtc_boot_count++;
           // Restore battery state from RTC (survives deep sleep)
@@ -88,6 +122,13 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
+# Disable safe_mode: its boot-loop detector counts every deep-sleep wake
+# as a "failed boot" (uptime < boot_is_good_after, default 60s) and
+# eventually triggers an OTA rollback that cold-boots the chip and wipes
+# RTC memory — observed a couple of times per day in deep-sleep mode.
+safe_mode:
+  disabled: true
+
 time:
   - platform: sntp
     id: sntp_time
@@ -137,6 +178,10 @@ globals:
     restore_value: no
     initial_value: '0.0'
   - id: is_charging
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: is_usb_plugged
     type: bool
     restore_value: no
     initial_value: 'false'
@@ -291,7 +336,7 @@ sensor:
           - script.execute: ble_advertise
           # Enter deep sleep if WiFi is OFF
           - lambda: |-
-              if (!id(wifi_enabled)) {
+              if (!id(wifi_enabled) && !id(is_usb_plugged)) {
                 // Hold e-paper GPIO states so display doesn't blank during sleep
                 gpio_hold_en(GPIO_NUM_5);   // CS
                 gpio_hold_en(GPIO_NUM_16);  // RESET
@@ -302,6 +347,8 @@ sensor:
                 ESP_LOGI("sleep", "Entering deep sleep for %d s", id(update_interval_secs));
                 id(deep_sleep_ctrl).set_sleep_duration(dur_ms);
                 id(deep_sleep_ctrl).begin_sleep(true);
+              } else if (id(is_usb_plugged)) {
+                ESP_LOGI("sleep", "USB plugged — staying awake");
               }
     temperature:
       name: "Temperature"
@@ -342,10 +389,9 @@ sensor:
               }
             }
             id(battery_pct) = pct;
-            // Charging detection: voltage rose >50mV (above ADC noise)
-            if (id(last_battery_voltage) > 0.0f) {
-              id(is_charging) = (v - id(last_battery_voltage)) > 0.05f;
-            }
+            // USB plugged when battery terminal exceeds Li-ion max (charger holds it higher)
+            id(is_usb_plugged) = (v > 4.25f);
+            id(is_charging) = id(is_usb_plugged);
             id(last_battery_voltage) = v;
             // Persist battery state in RTC (survives deep sleep)
             rtc_batt_pct = pct;
@@ -359,13 +405,26 @@ interval:
       - if:
           condition:
             lambda: |-
-              if (!id(wifi_enabled)) return false;
+              if (!id(wifi_enabled) && !id(is_usb_plugged)) return false;
               if (id(last_measurement_time) == 0) return false;
               uint32_t now_s = millis() / 1000;
               return (now_s - id(last_measurement_time)) >= (uint32_t)id(update_interval_secs);
           then:
             - component.update: battery_voltage
             - component.update: scd4x_sensor
+  # Periodic echo of last-wipe diagnostic. Fires while device is awake
+  # (WiFi ON) so the info is retrievable any time a log session attaches.
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (rtc_last_wipe_reason != 0) {
+            ESP_LOGW("diag", "last_wipe: reason=%d wakeup=%d at_boot#=%u (boot#=%d, buf=%d)",
+                     rtc_last_wipe_reason, rtc_last_wipe_wakeup,
+                     (unsigned)rtc_last_wipe_boot, rtc_boot_count, rtc_count);
+          } else {
+            ESP_LOGI("diag", "no wipe seen yet (boot#=%d, buf=%d)",
+                     rtc_boot_count, rtc_count);
+          }
 
 spi:
   clk_pin: GPIO18
@@ -487,17 +546,13 @@ display:
       // === BOTTOM BAR (both layouts) ===
       it.line(0, 96, 250, 96);
       {
-        // Interval + time
+        // Interval label only — wall-clock omitted because the RTC slow
+        // clock drifts across long deep sleep (no SNTP re-sync in WiFi-OFF)
+        // and e-ink is static between wakes, so any "ago" rendered at draw
+        // time would always read ~0s.
         int s = id(update_interval_secs);
         const char* istr = s == 60 ? "1m" : (s == 120 ? "2m" : "5m");
-        char bot[32] = "";
-        if (id(sntp_time).now().is_valid()) {
-          auto t = id(sntp_time).now();
-          sprintf(bot, "%s | %02d:%02d", istr, t.hour, t.minute);
-        } else {
-          sprintf(bot, "%s | --:--", istr);
-        }
-        it.print(0, 99, id(font_small), bot);
+        it.print(0, 99, id(font_small), istr);
 
         // WiFi status icon (MDI)
         int wix = 105, wiy = 98;

@@ -1,6 +1,7 @@
 .DS_Store
 .venv/
 CLAUDE.md
+TODO.md
 co2-sensor/.esphome/
 co2-sensor/secrets.yaml
 co2-sensor/local.yaml
